@@ -33,18 +33,7 @@ local runtimeName = getRuntimeGameName()
 local normalizedRuntimeName = normalizeName(runtimeName)
 local normalizedGameName = normalizeName(game.Name)
 
-if not normalizedRuntimeName:find("flee the facility", 1, true)
-    and not normalizedGameName:find("flee the facility", 1, true)
-then
-    error(string.format(
-        "[LuminaLoader] unsupported game | name=%s | placeId=%s | universeId=%s",
-        tostring(runtimeName),
-        tostring(game.PlaceId),
-        tostring(game.GameId)
-    ))
-end
-
-local mainSource = [====[
+local mainSource = [================[
 -- Minimal bootstrap: keep startup close to second.lua because the heavier boot path crashes in Madium
 local RuntimeEnv = nil
 -- selene: allow(incorrect_standard_library_use)
@@ -3517,9 +3506,9 @@ print("vesper.lua loaded successfully!")
 print("Press INSERT to open the UI")
 LogBoot("startup complete")
 
-]====]
+]================]
 
-local helperSource = [====[
+local helperSource = [================[
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -3869,7 +3858,117 @@ end
 
 print("[ComputerTP] helper loaded")
 
-]====]
+]================]
 
-runChunk("main.lua", mainSource)
-runChunk("computer_tp_helper.lua", helperSource)
+local bladeBallSource = [================[
+-- Minimal Blade Ball scaffold using the same Obsidian UI shell as the FTF script.
+-- Feature logic can be dropped into the toggle callbacks later.
+
+-- selene: allow(incorrect_standard_library_use)
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
+
+local State = {
+    AutoParry = false,
+    BallESP = false,
+    PlayerESP = false,
+    AutoSpam = false
+}
+
+local function setState(stateKey, featureName, value)
+    State[stateKey] = value
+    print(string.format("[Blade Ball] %s = %s", featureName, tostring(State[stateKey])))
+end
+
+local Window = Library:CreateWindow({
+    Title = "vesper.lua",
+    Footer = "Blade Ball scaffold",
+    Center = true,
+    Resizable = true,
+    AutoShow = true,
+    ToggleKeybind = Enum.KeyCode.Insert
+})
+
+local MainTab = Window:AddTab("Main", "shield")
+local VisualTab = Window:AddTab("Visuals", "user")
+local SettingsTab = Window:AddTab("Settings", "settings")
+local InfoTab = Window:AddTab("Info", "info")
+
+local MainGroup = MainTab:AddLeftGroupbox("Combat")
+local VisualGroup = VisualTab:AddLeftGroupbox("ESP")
+local SettingsGroup = SettingsTab:AddLeftGroupbox("Controls")
+local InfoGroup = InfoTab:AddLeftGroupbox("About")
+
+MainGroup:AddToggle("BladeBall_AutoParry", {
+    Text = "Auto Parry",
+    Default = false,
+    Callback = function(value)
+        setState("AutoParry", "Auto Parry", value)
+    end
+})
+
+MainGroup:AddToggle("BladeBall_AutoSpam", {
+    Text = "Auto Spam",
+    Default = false,
+    Callback = function(value)
+        setState("AutoSpam", "Auto Spam", value)
+    end
+})
+
+VisualGroup:AddToggle("BladeBall_BallESP", {
+    Text = "Ball ESP",
+    Default = false,
+    Callback = function(value)
+        setState("BallESP", "Ball ESP", value)
+    end
+})
+
+VisualGroup:AddToggle("BladeBall_PlayerESP", {
+    Text = "Player ESP",
+    Default = false,
+    Callback = function(value)
+        setState("PlayerESP", "Player ESP", value)
+    end
+})
+
+SettingsGroup:AddButton({
+    Text = "Unload",
+    Func = function()
+        if Library and Library.Unload and not Library.Unloaded then
+            pcall(function()
+                Library:Unload()
+            end)
+        end
+    end
+})
+
+InfoGroup:AddLabel("vesper.lua - Blade Ball")
+InfoGroup:AddLabel("")
+InfoGroup:AddLabel("Scaffold ready.")
+InfoGroup:AddLabel("Drop Blade Ball feature logic into the toggle callbacks.")
+InfoGroup:AddLabel("")
+InfoGroup:AddLabel("Controls:")
+InfoGroup:AddLabel("  - INSERT - Show / Hide UI")
+
+print("Blade Ball scaffold loaded successfully!")
+print("Press INSERT to open the UI")
+
+]================]
+
+if normalizedRuntimeName:find("flee the facility", 1, true)
+    or normalizedGameName:find("flee the facility", 1, true)
+then
+    runChunk("main.lua", mainSource)
+    runChunk("computer_tp_helper.lua", helperSource)
+elseif normalizedRuntimeName:find("blade ball", 1, true)
+    or normalizedGameName:find("blade ball", 1, true)
+then
+    runChunk("blade_ball.lua", bladeBallSource)
+else
+    error(string.format(
+        "[LuminaLoader] unsupported game | name=%s | placeId=%s | universeId=%s",
+        tostring(runtimeName),
+        tostring(game.PlaceId),
+        tostring(game.GameId)
+    ))
+end
+
