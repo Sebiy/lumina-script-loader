@@ -1,39 +1,32 @@
 local function normalizeName(value)
     return string.lower(tostring(value or ""))
 end
-
 local function getRuntimeGameName()
     local fallbackName = game.Name
     local marketplaceService = game:GetService("MarketplaceService")
-
     local productInfoOk, productInfo = pcall(function()
         return marketplaceService:GetProductInfo(game.PlaceId)
     end)
-
     if productInfoOk and type(productInfo) == "table" and productInfo.Name then
         return productInfo.Name
     end
-
     return fallbackName
 end
-
 local function runChunk(label, source)
     local chunk = loadstring(source)
     if not chunk then
         error(string.format("[LuminaLoader] failed to compile %s", tostring(label)))
     end
-
     local ok, err = pcall(chunk)
     if not ok then
         error(string.format("[LuminaLoader] %s failed: %s", tostring(label), tostring(err)))
     end
 end
-
 local runtimeName = getRuntimeGameName()
 local normalizedRuntimeName = normalizeName(runtimeName)
 local normalizedGameName = normalizeName(game.Name)
-
-local mainSource = [================[
+local placeId = game.PlaceId
+local mainSource = [=[
 -- Minimal bootstrap: keep startup close to second.lua because the heavier boot path crashes in Madium
 local RuntimeEnv = nil
 -- selene: allow(incorrect_standard_library_use)
@@ -3506,9 +3499,8 @@ print("vesper.lua loaded successfully!")
 print("Press INSERT to open the UI")
 LogBoot("startup complete")
 
-]================]
-
-local helperSource = [================[
+]=]
+local helperSource = [=[
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -3858,30 +3850,400 @@ end
 
 print("[ComputerTP] helper loaded")
 
-]================]
+]=]
+local bladeBallSource = [=[
+-- Blade Ball hub foundation.
+-- This file intentionally keeps the feature callbacks lightweight so game-specific
+-- logic can be added without rebuilding the UI/runtime shell every time.
 
-local bladeBallSource = [================[
--- Minimal Blade Ball scaffold using the same Obsidian UI shell as the FTF script.
--- Feature logic can be dropped into the toggle callbacks later.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+-- selene: allow(undefined_variable, global_usage)
+local RuntimeEnv = (getgenv and getgenv()) or shared
+local ExistingRuntime = RuntimeEnv and RuntimeEnv.BladeBallRuntime
+if ExistingRuntime and ExistingRuntime.Stop then
+    pcall(ExistingRuntime.Stop)
+end
 
 -- selene: allow(incorrect_standard_library_use)
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/refs/heads/main/Library.lua"))()
 
 local State = {
-    AutoParry = false,
-    BallESP = false,
-    PlayerESP = false,
-    AutoSpam = false
+    Combat = {
+        AutoParry = false,
+        AutoSpam = false,
+        HitChance = 100,
+        ParryDistance = 18
+    },
+    Visuals = {
+        BallESP = false,
+        PlayerESP = false,
+        ShowDistance = true,
+        ThemeAccent = Color3.fromRGB(255, 92, 92)
+    },
+    Utility = {
+        AutoJoinMatch = false,
+        AutoClaimSpin = false,
+        NotificationSound = true
+    }
 }
 
-local function setState(stateKey, featureName, value)
-    State[stateKey] = value
-    print(string.format("[Blade Ball] %s = %s", featureName, tostring(State[stateKey])))
+local Runtime = {
+    IsRunning = true,
+    HeartbeatConnection = nil,
+    StatusLabel = nil,
+    MatchLabel = nil,
+    ProbeLabel = nil,
+    BallLabel = nil,
+    Hash = nil,
+    UUID = nil,
+    ParryRemote = nil,
+    LastProbeMessage = "Parry remote not resolved",
+    LastBallMessage = "Ball tracker idle",
+    LastParryAt = 0,
+    LastBallInstance = nil,
+    LastDeadCount = 0
+}
+
+local function log(message)
+    print(string.format("[Blade Ball Hub] %s", tostring(message)))
+end
+
+local function getRuntimeGameName()
+    local ok, productInfo = pcall(function()
+        return MarketplaceService:GetProductInfo(game.PlaceId)
+    end)
+
+    if ok and type(productInfo) == "table" and productInfo.Name then
+        return tostring(productInfo.Name)
+    end
+
+    return tostring(game.Name)
+end
+
+local function updateStatusLabel()
+    if Runtime.StatusLabel then
+        Runtime.StatusLabel:SetText(string.format(
+            "Auto %s | Spam %s | Ball ESP %s | Player ESP %s",
+            State.Combat.AutoParry and "ON" or "OFF",
+            State.Combat.AutoSpam and "ON" or "OFF",
+            State.Visuals.BallESP and "ON" or "OFF",
+            State.Visuals.PlayerESP and "ON" or "OFF"
+        ))
+    end
+end
+
+local function updateMatchLabel()
+    if Runtime.MatchLabel then
+        Runtime.MatchLabel:SetText(string.format(
+            "Game: %s | PlaceId: %s | Players: %d",
+            getRuntimeGameName(),
+            tostring(game.PlaceId),
+            #Players:GetPlayers()
+        ))
+    end
+end
+
+local function updateProbeLabel()
+    if Runtime.ProbeLabel then
+        Runtime.ProbeLabel:SetText(Runtime.LastProbeMessage)
+    end
+end
+
+local function updateBallLabel()
+    if Runtime.BallLabel then
+        Runtime.BallLabel:SetText(Runtime.LastBallMessage)
+    end
+end
+
+local function setState(sectionKey, stateKey, featureName, value)
+    State[sectionKey][stateKey] = value
+    log(string.format("%s = %s", featureName, tostring(value)))
+    updateStatusLabel()
+end
+
+local function notify(featureName, enabled)
+    local stateText = enabled and "enabled" or "disabled"
+    log(string.format("%s %s", featureName, stateText))
+end
+
+local function getCharacterRoot(character)
+    if not character then
+        return nil
+    end
+
+    return character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character.PrimaryPart
+end
+
+local function getBallsFolder()
+    return workspace:FindFirstChild("Balls")
+end
+
+local function getDeadFolder()
+    return workspace:FindFirstChild("Dead")
+end
+
+local function getDeadCount()
+    local deadFolder = getDeadFolder()
+    if not deadFolder then
+        return 0
+    end
+
+    return #deadFolder:GetChildren()
+end
+
+local function getBallBasePart(ball)
+    if not ball then
+        return nil
+    end
+
+    if ball:IsA("BasePart") then
+        return ball
+    end
+
+    if ball:IsA("Model") then
+        return ball.PrimaryPart
+            or ball:FindFirstChildWhichIsA("BasePart")
+    end
+
+    return nil
+end
+
+local function getBallVelocity(ballPart)
+    if not ballPart then
+        return Vector3.zero
+    end
+
+    return ballPart.AssemblyLinearVelocity or ballPart.Velocity or Vector3.zero
+end
+
+local function scoreBallCandidate(ball, localRoot)
+    local ballPart = getBallBasePart(ball)
+    if not ballPart or not ballPart.Parent then
+        return nil
+    end
+
+    local velocity = getBallVelocity(ballPart)
+    local speed = velocity.Magnitude
+    local distance = localRoot and (ballPart.Position - localRoot.Position).Magnitude or math.huge
+    local score = speed
+
+    if tostring(ball.Name):match("^%d%d%d+$") then
+        score += 250
+    elseif tostring(ball.Name):match("^%d+$") then
+        score += 150
+    end
+
+    if Runtime.LastBallInstance and ball == Runtime.LastBallInstance then
+        score += 35
+    end
+
+    if distance < math.huge then
+        score += math.max(0, 120 - distance)
+    end
+
+    return {
+        Ball = ball,
+        Part = ballPart,
+        Velocity = velocity,
+        Speed = speed,
+        Distance = distance,
+        Score = score
+    }
+end
+
+local function getTrackedBall()
+    local localCharacter = Players.LocalPlayer and Players.LocalPlayer.Character
+    local localRoot = getCharacterRoot(localCharacter)
+    local ballsFolder = getBallsFolder()
+
+    if not ballsFolder or not localRoot then
+        Runtime.LastBallMessage = "Ball tracker waiting for workspace.Balls or character root"
+        return nil
+    end
+
+    local bestCandidate = nil
+    for _, child in ipairs(ballsFolder:GetChildren()) do
+        local candidate = scoreBallCandidate(child, localRoot)
+        if candidate and (not bestCandidate or candidate.Score > bestCandidate.Score) then
+            bestCandidate = candidate
+        end
+    end
+
+    if not bestCandidate then
+        Runtime.LastBallInstance = nil
+        Runtime.LastBallMessage = "No ball candidate found"
+        return nil
+    end
+
+    Runtime.LastBallInstance = bestCandidate.Ball
+    Runtime.LastBallMessage = string.format(
+        "Ball %s | Speed %.1f | Dist %.1f",
+        tostring(bestCandidate.Ball.Name),
+        bestCandidate.Speed,
+        bestCandidate.Distance
+    )
+    return bestCandidate
+end
+
+local function dumpBallCandidates()
+    local localCharacter = Players.LocalPlayer and Players.LocalPlayer.Character
+    local localRoot = getCharacterRoot(localCharacter)
+    local ballsFolder = getBallsFolder()
+
+    if not ballsFolder then
+        log("Ball dump failed: workspace.Balls missing")
+        return
+    end
+
+    for index, child in ipairs(ballsFolder:GetChildren()) do
+        local part = getBallBasePart(child)
+        local velocity = getBallVelocity(part)
+        local distance = (localRoot and part) and (part.Position - localRoot.Position).Magnitude or -1
+        log(string.format(
+            "Ball[%d] name=%s class=%s speed=%.1f dist=%.1f numeric=%s",
+            index,
+            tostring(child.Name),
+            child.ClassName,
+            velocity.Magnitude,
+            distance,
+            tostring(tostring(child.Name):match("^%d+$") ~= nil)
+        ))
+    end
+end
+
+local function shouldParryBall(ballData)
+    if not ballData then
+        return false
+    end
+
+    local localCharacter = Players.LocalPlayer and Players.LocalPlayer.Character
+    local localRoot = getCharacterRoot(localCharacter)
+    if not localRoot then
+        return false
+    end
+
+    if ballData.Distance > State.Combat.ParryDistance then
+        return false
+    end
+
+    if ballData.Speed < 8 then
+        return false
+    end
+
+    local directionToPlayer = localRoot.Position - ballData.Part.Position
+    if directionToPlayer.Magnitude <= 0.001 then
+        return true
+    end
+
+    local dot = ballData.Velocity.Unit:Dot(directionToPlayer.Unit)
+    return dot >= 0.55
+end
+
+local function resolveParryProbe()
+    local hash = nil
+    local uuid = nil
+    local parryRemote = nil
+
+    for _, object in pairs(getgc(true)) do
+        if type(object) ~= "table" then
+            continue
+        end
+
+        local remote = rawget(object, 0)
+        local sub3 = rawget(object, 3)
+
+        if typeof(remote) == "Instance"
+            and remote:IsA("RemoteEvent")
+            and type(sub3) == "table"
+            and type(rawget(sub3, 2)) == "string"
+            and type(rawget(sub3, 3)) == "number"
+        then
+            hash = rawget(sub3, 2)
+            uuid = rawget(object, rawget(sub3, 3) + 4)
+        end
+
+        local encodeFunction = rawget(object, 2)
+        local encoderUUID = rawget(object, 3)
+
+        if not parryRemote
+            and type(encodeFunction) == "function"
+            and type(encoderUUID) == "string"
+            and encoderUUID:match("^%x%x%x%x%x%x%x%x%-")
+            and type(rawget(object, 0)) == "table"
+        then
+            local replicatedStorage = game:GetService("ReplicatedStorage")
+            local packages = replicatedStorage:FindFirstChild("Packages")
+            local packageIndex = packages and packages:FindFirstChild("_Index")
+            local netPackage = packageIndex and packageIndex:FindFirstChild("sleitnick_net@0.1.0")
+            local netFolder = netPackage and netPackage:FindFirstChild("net")
+
+            if netFolder then
+                local remoteName = "RE/" .. encodeFunction(encoderUUID:gsub("-", ""), encoderUUID)
+                parryRemote = netFolder:FindFirstChild(remoteName)
+            end
+        end
+
+        if hash and parryRemote and uuid then
+            break
+        end
+    end
+
+    Runtime.Hash = hash
+    Runtime.UUID = uuid
+    Runtime.ParryRemote = parryRemote
+
+    if Runtime.ParryRemote and Runtime.Hash and Runtime.UUID then
+        Runtime.LastProbeMessage = string.format(
+            "Parry ready | %s | Hash %s",
+            Runtime.ParryRemote.Name,
+            tostring(Runtime.Hash)
+        )
+        log(string.format("Parry probe resolved | remote=%s | hash=%s", Runtime.ParryRemote.Name, tostring(Runtime.Hash)))
+        return true
+    end
+
+    Runtime.LastProbeMessage = string.format(
+        "Parry probe failed | %s%s%s",
+        Runtime.Hash and "" or "No Hash ",
+        Runtime.ParryRemote and "" or "No Remote ",
+        Runtime.UUID and "" or "No UUID"
+    )
+    log(Runtime.LastProbeMessage)
+    return false
+end
+
+local function fireParry()
+    if not (Runtime.ParryRemote and Runtime.Hash and Runtime.UUID) then
+        local resolved = resolveParryProbe()
+        updateProbeLabel()
+        if not resolved then
+            return false, "probe failed"
+        end
+    end
+
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return false, "missing current camera"
+    end
+
+    Runtime.ParryRemote:FireServer(Runtime.UUID, Runtime.Hash, 0, camera.CFrame, {}, { 0, 0 }, false)
+    Runtime.LastParryAt = os.clock()
+    return true
+end
+
+if RuntimeEnv then
+    RuntimeEnv.Parry = fireParry
 end
 
 local Window = Library:CreateWindow({
     Title = "vesper.lua",
-    Footer = "Blade Ball scaffold",
+    Footer = "Blade Ball hub",
     Center = true,
     Resizable = true,
     AutoShow = true,
@@ -3889,71 +4251,267 @@ local Window = Library:CreateWindow({
 })
 
 local MainTab = Window:AddTab("Main", "shield")
-local VisualTab = Window:AddTab("Visuals", "user")
-local SettingsTab = Window:AddTab("Settings", "settings")
+local VisualTab = Window:AddTab("Visuals", "eye")
+local UtilityTab = Window:AddTab("Utility", "wrench")
 local InfoTab = Window:AddTab("Info", "info")
 
-local MainGroup = MainTab:AddLeftGroupbox("Combat")
+local CombatGroup = MainTab:AddLeftGroupbox("Combat")
+local TuningGroup = MainTab:AddRightGroupbox("Tuning")
 local VisualGroup = VisualTab:AddLeftGroupbox("ESP")
-local SettingsGroup = SettingsTab:AddLeftGroupbox("Controls")
+local ThemeGroup = VisualTab:AddRightGroupbox("Theme")
+local UtilityGroup = UtilityTab:AddLeftGroupbox("Automation")
+local ControlGroup = UtilityTab:AddRightGroupbox("Controls")
 local InfoGroup = InfoTab:AddLeftGroupbox("About")
+local StatusGroup = InfoTab:AddRightGroupbox("Runtime")
 
-MainGroup:AddToggle("BladeBall_AutoParry", {
+CombatGroup:AddToggle("BladeBall_AutoParry", {
     Text = "Auto Parry",
-    Default = false,
+    Default = State.Combat.AutoParry,
     Callback = function(value)
-        setState("AutoParry", "Auto Parry", value)
+        setState("Combat", "AutoParry", "Auto Parry", value)
+        notify("Auto Parry", value)
     end
 })
 
-MainGroup:AddToggle("BladeBall_AutoSpam", {
+CombatGroup:AddToggle("BladeBall_AutoSpam", {
     Text = "Auto Spam",
-    Default = false,
+    Default = State.Combat.AutoSpam,
     Callback = function(value)
-        setState("AutoSpam", "Auto Spam", value)
+        setState("Combat", "AutoSpam", "Auto Spam", value)
+        notify("Auto Spam", value)
+    end
+})
+
+TuningGroup:AddSlider("BladeBall_HitChance", {
+    Text = "Hit Chance",
+    Default = State.Combat.HitChance,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+    Callback = function(value)
+        setState("Combat", "HitChance", "Hit Chance", value)
+    end
+})
+
+TuningGroup:AddSlider("BladeBall_ParryDistance", {
+    Text = "Parry Distance",
+    Default = State.Combat.ParryDistance,
+    Min = 5,
+    Max = 40,
+    Rounding = 0,
+    Callback = function(value)
+        setState("Combat", "ParryDistance", "Parry Distance", value)
     end
 })
 
 VisualGroup:AddToggle("BladeBall_BallESP", {
     Text = "Ball ESP",
-    Default = false,
+    Default = State.Visuals.BallESP,
     Callback = function(value)
-        setState("BallESP", "Ball ESP", value)
+        setState("Visuals", "BallESP", "Ball ESP", value)
+        notify("Ball ESP", value)
     end
 })
 
 VisualGroup:AddToggle("BladeBall_PlayerESP", {
     Text = "Player ESP",
-    Default = false,
+    Default = State.Visuals.PlayerESP,
     Callback = function(value)
-        setState("PlayerESP", "Player ESP", value)
+        setState("Visuals", "PlayerESP", "Player ESP", value)
+        notify("Player ESP", value)
     end
 })
 
-SettingsGroup:AddButton({
-    Text = "Unload",
-    Func = function()
-        if Library and Library.Unload and not Library.Unloaded then
-            pcall(function()
-                Library:Unload()
-            end)
-        end
+VisualGroup:AddToggle("BladeBall_ShowDistance", {
+    Text = "Distance Text",
+    Default = State.Visuals.ShowDistance,
+    Callback = function(value)
+        setState("Visuals", "ShowDistance", "Distance Text", value)
     end
+})
+
+ThemeGroup:AddLabel("Accent color for future drawings/highlights.")
+ThemeGroup:AddColorPicker("BladeBall_ThemeAccent", {
+    Default = State.Visuals.ThemeAccent,
+    Title = "Accent Color",
+    Callback = function(color)
+        setState("Visuals", "ThemeAccent", "Accent Color", color)
+    end
+})
+
+UtilityGroup:AddToggle("BladeBall_AutoJoinMatch", {
+    Text = "Auto Join Match",
+    Default = State.Utility.AutoJoinMatch,
+    Callback = function(value)
+        setState("Utility", "AutoJoinMatch", "Auto Join Match", value)
+    end
+})
+
+UtilityGroup:AddToggle("BladeBall_AutoClaimSpin", {
+    Text = "Auto Claim Spin",
+    Default = State.Utility.AutoClaimSpin,
+    Callback = function(value)
+        setState("Utility", "AutoClaimSpin", "Auto Claim Spin", value)
+    end
+})
+
+UtilityGroup:AddToggle("BladeBall_NotificationSound", {
+    Text = "Notification Sound",
+    Default = State.Utility.NotificationSound,
+    Callback = function(value)
+        setState("Utility", "NotificationSound", "Notification Sound", value)
+    end
+})
+
+ControlGroup:AddButton({
+    Text = "Probe Parry Remote",
+    Func = function()
+        resolveParryProbe()
+        updateProbeLabel()
+    end
+})
+
+ControlGroup:AddButton({
+    Text = "Test Parry",
+    Func = function()
+        local success, reason = fireParry()
+        if success then
+            log("Manual parry fired")
+        else
+            log("Manual parry failed: " .. tostring(reason))
+        end
+        updateProbeLabel()
+    end
+})
+
+ControlGroup:AddButton({
+    Text = "Dump Balls",
+    Func = dumpBallCandidates
+})
+
+ControlGroup:AddButton({
+    Text = "Enable Core",
+    Func = function()
+        Library.Options.BladeBall_AutoParry:SetValue(true)
+        Library.Options.BladeBall_BallESP:SetValue(true)
+        Library.Options.BladeBall_PlayerESP:SetValue(true)
+    end
+})
+
+ControlGroup:AddButton({
+    Text = "Disable All",
+    Func = function()
+        Library.Options.BladeBall_AutoParry:SetValue(false)
+        Library.Options.BladeBall_AutoSpam:SetValue(false)
+        Library.Options.BladeBall_BallESP:SetValue(false)
+        Library.Options.BladeBall_PlayerESP:SetValue(false)
+        Library.Options.BladeBall_AutoJoinMatch:SetValue(false)
+        Library.Options.BladeBall_AutoClaimSpin:SetValue(false)
+    end
+})
+
+local function stopRuntime()
+    if not Runtime.IsRunning then
+        return
+    end
+
+    Runtime.IsRunning = false
+
+    if Runtime.HeartbeatConnection then
+        Runtime.HeartbeatConnection:Disconnect()
+        Runtime.HeartbeatConnection = nil
+    end
+
+    if Library and Library.Unload and not Library.Unloaded then
+        pcall(function()
+            Library:Unload()
+        end)
+    end
+
+    if RuntimeEnv then
+        RuntimeEnv.BladeBallRuntime = nil
+    end
+end
+
+ControlGroup:AddButton({
+    Text = "Unload",
+    Func = stopRuntime
 })
 
 InfoGroup:AddLabel("vesper.lua - Blade Ball")
 InfoGroup:AddLabel("")
-InfoGroup:AddLabel("Scaffold ready.")
-InfoGroup:AddLabel("Drop Blade Ball feature logic into the toggle callbacks.")
+InfoGroup:AddLabel("This is the hub shell for your Blade Ball route.")
+InfoGroup:AddLabel("Drop game logic into the central state/runtime layer,")
+InfoGroup:AddLabel("not directly into random toggle callbacks.")
 InfoGroup:AddLabel("")
 InfoGroup:AddLabel("Controls:")
 InfoGroup:AddLabel("  - INSERT - Show / Hide UI")
 
-print("Blade Ball scaffold loaded successfully!")
-print("Press INSERT to open the UI")
+Runtime.StatusLabel = StatusGroup:AddLabel("")
+Runtime.MatchLabel = StatusGroup:AddLabel("")
+Runtime.ProbeLabel = StatusGroup:AddLabel("")
+Runtime.BallLabel = StatusGroup:AddLabel("")
+StatusGroup:AddLabel("Re-executing the script cleans the previous runtime.")
 
-]================]
+updateStatusLabel()
+updateMatchLabel()
+resolveParryProbe()
+updateProbeLabel()
+updateBallLabel()
 
+Runtime.HeartbeatConnection = RunService.Heartbeat:Connect(function()
+    if not Runtime.IsRunning then
+        return
+    end
+
+    local deadCount = getDeadCount()
+    if deadCount ~= Runtime.LastDeadCount then
+        Runtime.LastDeadCount = deadCount
+        Runtime.LastBallInstance = nil
+        Runtime.LastBallMessage = string.format("Dead folder changed (%d), refreshing live ball", deadCount)
+    end
+
+    local trackedBall = getTrackedBall()
+
+    if State.Combat.AutoParry and trackedBall and shouldParryBall(trackedBall) then
+        local now = os.clock()
+        if now - Runtime.LastParryAt >= 0.2 then
+            local roll = math.random(1, 100)
+            if roll <= State.Combat.HitChance then
+                local success, reason = fireParry()
+                if not success then
+                    Runtime.LastBallMessage = "Parry failed: " .. tostring(reason)
+                else
+                    Runtime.LastBallMessage = string.format(
+                        "Parried %s | Speed %.1f | Dist %.1f",
+                        tostring(trackedBall.Ball.Name),
+                        trackedBall.Speed,
+                        trackedBall.Distance
+                    )
+                end
+            end
+        end
+    end
+
+    updateMatchLabel()
+    updateBallLabel()
+end)
+
+if RuntimeEnv then
+    RuntimeEnv.BladeBallRuntime = {
+        Stop = stopRuntime,
+        State = State,
+        Parry = fireParry,
+        ResolveParryProbe = resolveParryProbe,
+        GetTrackedBall = getTrackedBall,
+        DumpBallCandidates = dumpBallCandidates
+    }
+end
+
+log("Blade Ball hub loaded")
+log("Press INSERT to open the UI")
+
+]=]
 if normalizedRuntimeName:find("flee the facility", 1, true)
     or normalizedGameName:find("flee the facility", 1, true)
 then
@@ -3961,6 +4519,7 @@ then
     runChunk("computer_tp_helper.lua", helperSource)
 elseif normalizedRuntimeName:find("blade ball", 1, true)
     or normalizedGameName:find("blade ball", 1, true)
+    or placeId == 13772394625
 then
     runChunk("blade_ball.lua", bladeBallSource)
 else
@@ -3971,4 +4530,3 @@ else
         tostring(game.GameId)
     ))
 end
-
